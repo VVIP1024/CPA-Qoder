@@ -1,0 +1,63 @@
+diff --git a/internal/pluginhost/host_callbacks.go b/internal/pluginhost/host_callbacks.go
+index 4af872a..1dd305d 100644
+--- a/internal/pluginhost/host_callbacks.go
++++ b/internal/pluginhost/host_callbacks.go
+@@ -141,7 +141,8 @@ func hostCallbackPluginIDFromContext(ctx context.Context) string {
+ }
+ 
+ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte) ([]byte, error) {
+-	if instance := hostCallbackInstanceFromContext(ctx); instance != nil && instance.closed.Load() {
++	// Stream cleanup must remain available during native shutdown to release pending emits.
++	if instance := hostCallbackInstanceFromContext(ctx); instance != nil && instance.closed.Load() && method != pluginabi.MethodHostStreamClose {
+ 		return nil, fmt.Errorf("host plugin callback instance is closed")
+ 	}
+ 	switch method {
+diff --git a/internal/pluginhost/host_callbacks_test.go b/internal/pluginhost/host_callbacks_test.go
+index dc06e85..00b2e30 100644
+--- a/internal/pluginhost/host_callbacks_test.go
++++ b/internal/pluginhost/host_callbacks_test.go
+@@ -1696,3 +1696,44 @@ func TestHostModelExecuteCallbackPreservesHTTPStatusOnError(t *testing.T) {
+ 		t.Fatalf("clienterror.HTTPStatusFromError(errCall) = %d, want %d", got, http.StatusTooManyRequests)
+ 	}
+ }
++
++func TestClosedInstanceCanCloseSaturatedExecutorStream(t *testing.T) {
++	host := New()
++	instance := &hostCallbackInstance{}
++	ctx := withHostCallbackIdentity(context.Background(), "stream-plugin", instance)
++	streamID, _, cleanup := host.streams.open(context.Background())
++	defer cleanup()
++	rawEmit, _ := json.Marshal(rpcStreamEmitRequest{StreamID: streamID, Payload: []byte("chunk")})
++	for range streamBridgeBufferSize {
++		if _, err := host.callFromPlugin(ctx, pluginabi.MethodHostStreamEmit, rawEmit); err != nil {
++			t.Fatal(err)
++		}
++	}
++	notifyCtx := &streamBridgeNotifyContext{Context: ctx, ready: make(chan struct{})}
++	emitDone := make(chan error, 1)
++	go func() {
++		_, err := host.callFromPlugin(notifyCtx, pluginabi.MethodHostStreamEmit, rawEmit)
++		emitDone <- err
++	}()
++	select {
++	case <-notifyCtx.ready:
++	case <-time.After(time.Second):
++		t.Fatal("emit never reached saturated queue")
++	}
++	host.closeHostHTTPCallbackInstance("stream-plugin", instance)
++	if _, err := host.callFromPlugin(ctx, pluginabi.MethodHostStreamEmit, rawEmit); err == nil {
++		t.Fatal("closed instance accepted new output")
++	}
++	rawClose, _ := json.Marshal(rpcStreamCloseRequest{StreamID: streamID})
++	if _, err := host.callFromPlugin(ctx, pluginabi.MethodHostStreamClose, rawClose); err != nil {
++		t.Fatalf("shutdown cleanup rejected: %v", err)
++	}
++	select {
++	case err := <-emitDone:
++		if err == nil {
++			t.Fatal("saturated emit succeeded")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("shutdown did not release pending callback")
++	}
++}

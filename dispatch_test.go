@@ -1,0 +1,238 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+func TestDispatchRegistersAndParsesActualWireSchema(t *testing.T) {
+	raw, err := dispatch("plugin.register", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reg struct {
+		SchemaVersion int            `json:"schema_version"`
+		Capabilities  map[string]any `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.SchemaVersion != 6 || reg.Capabilities["auth_provider"] != true || reg.Capabilities["executor"] != true {
+		t.Fatalf("bad registration: %s", raw)
+	}
+	data, _ := json.Marshal(map[string]any{"RawJSON": []byte(`{"type":"qoder","variant":"cn"}`)})
+	raw, err = dispatch("auth.parse", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Handled bool
+		Auth    struct {
+			Provider   string
+			Attributes map[string]string
+		}
+	}
+	if json.Unmarshal(raw, &out) != nil || !out.Handled || out.Auth.Provider != "qoder" || out.Auth.Attributes["variant"] != "cn" {
+		t.Fatalf("wire auth: %s", raw)
+	}
+}
+func TestRequestCompletionCancelsActiveGeneration(t *testing.T) {
+	p := testProvider(t)
+	ctx, done, err := p.track(context.Background(), "req1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer done()
+	old := current.Swap(p)
+	defer current.Store(old)
+	if _, err := dispatch("request.complete", []byte(`{"RequestID":"req1","Outcome":"canceled"}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("generation not canceled")
+	}
+	raw, err := dispatch("request.intercept_after", []byte(`{"RequestID":"req2","Model":"qoder/Auto"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct{ Headers map[string][]string }
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Headers[requestIDHeader][0] != "req2" {
+		t.Fatalf("correlation missing: %s", raw)
+	}
+}
+func TestMCPAdvertisesSchemaAndNeverExecutesCalls(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tools.json")
+	_ = os.WriteFile(path, []byte(`[{"name":"weather","description":"Weather","inputSchema":{"type":"object"}}]`), 0600)
+	input := `{"jsonrpc":"2.0","id":1,"method":"initialize"}` + "\n" + `{"jsonrpc":"2.0","id":2,"method":"tools/list"}` + "\n" + `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"weather"}}` + "\n"
+	assertMCP(t, path, input)
+}
+
+func assertMCP(t *testing.T, path, input string) {
+	t.Helper()
+	var out bytes.Buffer
+	if err := serveMCP(path, strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(out.String(), "weather") {
+		t.Fatalf("MCP unexpectedly executed a tool: %s", out.String())
+	}
+}
+
+func TestStreamChunksAreJSONForCPAFraming(t *testing.T) {
+	raw := streamFrame("qoder/Auto", "id", 1, map[string]any{"content": "OK"}, nil, nil)
+	if !json.Valid(raw) {
+		t.Fatalf("CPA expects an unframed JSON chunk: %s", raw)
+	}
+}
+func TestCloseWaitsForCanceledWorkers(t *testing.T) {
+	p := testProvider(t)
+	ctx, release, err := p.track(context.Background(), "closing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	go func() { p.Close(); close(closed) }()
+	<-ctx.Done()
+	select {
+	case <-closed:
+		t.Fatal("Close returned with an active worker")
+	case <-time.After(30 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not drain workers")
+	}
+}
+
+func TestStreamShutdownDrainsCallbacks(t *testing.T) {
+	for _, blocked := range []bool{false, true} {
+		t.Run(fmt.Sprint("backpressure=", blocked), func(t *testing.T) {
+			p := testProvider(t)
+			_ = os.WriteFile(filepath.Join(p.cfg.Global.ConfigDir, "block"), nil, 0600)
+			original := callHost
+			var closed atomic.Bool
+			var callbacks atomic.Int32
+			started := make(chan struct{}, 1)
+			released := make(chan struct{})
+			callHost = func(method string, payload any) (json.RawMessage, error) {
+				callbacks.Add(1)
+				defer callbacks.Add(-1)
+				if method == "host.stream.close" {
+					if !closed.CompareAndSwap(false, true) {
+						t.Error("stream closed twice")
+					}
+					close(released)
+					return nil, nil
+				}
+				if method == "host.stream.emit" {
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					if blocked {
+						<-released
+						return nil, fmt.Errorf("stream closed")
+					}
+					return nil, nil
+				}
+				return nil, fmt.Errorf("unexpected host callback")
+			}
+			defer func() { callHost = original }()
+			req := runRequest()
+			raw, _ := json.Marshal(struct {
+				pluginapi.ExecutorRequest
+				StreamID string `json:"stream_id"`
+			}{req, "stream"})
+			if _, err := startStream(p, raw); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("stream never started")
+			}
+			if !blocked {
+				deadline := time.After(5 * time.Second)
+				for {
+					if _, err := os.Stat(filepath.Join(p.cfg.Global.ConfigDir, "invocation.json")); err == nil {
+						break
+					}
+					select {
+					case <-deadline:
+						t.Fatal("silent child never started")
+					case <-time.After(time.Millisecond):
+					}
+				}
+			}
+			done := make(chan struct{})
+			go func() { p.Close(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("shutdown stuck with active callbacks")
+			}
+			if !closed.Load() || callbacks.Load() != 0 {
+				t.Fatal("shutdown returned before host callbacks drained")
+			}
+			if _, _, err := p.track(context.Background(), "late"); err == nil {
+				t.Fatal("closed provider accepted work")
+			}
+		})
+	}
+}
+
+func TestFinishChunkRemainsLastWithSlowHost(t *testing.T) {
+	p := testProvider(t)
+	original := callHost
+	var sawFinish atomic.Bool
+	closed := make(chan struct{})
+	callHost = func(method string, payload any) (json.RawMessage, error) {
+		if method == "host.stream.close" {
+			close(closed)
+			return nil, nil
+		}
+		if method == "host.stream.emit" {
+			if sawFinish.Load() {
+				t.Error("heartbeat emitted after finish chunk")
+			}
+			raw := payload.(map[string]any)["payload"].([]byte)
+			if bytes.Contains(raw, []byte(`"finish_reason":"stop"`)) {
+				sawFinish.Store(true)
+				<-time.After(1100 * time.Millisecond)
+			}
+		}
+		return nil, nil
+	}
+	defer func() { p.Close(); callHost = original }()
+	req := runRequest()
+	raw, _ := json.Marshal(struct {
+		pluginapi.ExecutorRequest
+		StreamID string `json:"stream_id"`
+	}{req, "slow"})
+	if _, err := startStream(p, raw); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream not closed")
+	}
+}

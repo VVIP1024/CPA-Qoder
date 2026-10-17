@@ -1,0 +1,49 @@
+# Build outputs and test artifacts
+/build/
+/bin/
+/dist/
+*.test
+*.out
+*.prof
+/coverage/
+
+# Local configuration, credentials and runtime data
+/config.yaml
+/config.yml
+/config.local.*
+/config.*.local.*
+.env
+.env.*
+!.env.example
+/auths/*
+!/auths/qoder-global.json
+!/auths/qoder-cn.json
+/auth.json
+/.qoder/
+/.qoder-cn/
+/state/
+/logs/
+/tmp/
+/.cache/
+/client-key
+*.log
+*.key
+*.pem
+
+# Python, editor and OS files
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+.DS_Store
+._*
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local code indexes and development notes
+/.codegraph/
+/docs/superpowers/
+/docs/progress.md

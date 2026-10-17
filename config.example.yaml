@@ -1,0 +1,34 @@
+# Run from CPA-Qoder: make run
+config-version: 8
+server:
+  host: "127.0.0.1"
+  port: 8317
+access:
+  api-keys:
+    - "replace-with-your-client-key"
+management:
+  allow-remote: false
+  disable-control-panel: true
+oauth:
+  auth-dir: "./auths"
+routing:
+  retry:
+    request-retry: 0
+plugins:
+  enabled: true
+  dir: "./build/plugins"
+  configs:
+    cpa-qoder:
+      enabled: true
+      priority: 1
+      # CLI transport proxy; empty inherits HTTP(S)_PROXY / ALL_PROXY.
+      proxy-url: ""
+      helper: "./build/cpa-qoder-helper"
+      global:
+        cli: "qodercli"
+        config-dir: "~/.qoder"
+        disabled: false
+      cn:
+        cli: "qoderclicn"
+        config-dir: "~/.qoder-cn"
+        disabled: false
