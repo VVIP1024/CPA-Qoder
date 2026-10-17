@@ -1,0 +1,82 @@
+//go:build cgo && (darwin || linux || freebsd)
+
+package pluginhost
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+// Loaded through a Go overlay. The CPA checkout is never edited.
+func TestNativePluginClosedHostBackpressure(t *testing.T) {
+	h := New()
+	root := t.TempDir()
+	cli := filepath.Join(root, "silent-cli")
+	if err := os.WriteFile(cli, []byte("#!/bin/sh\nsleep 60\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	authDir := filepath.Join(root, ".auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{"user", "machine_id"} {
+		if err := os.WriteFile(filepath.Join(authDir, file), []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := fmt.Sprintf("global:\n  cli: %s\n  config-dir: %s\ncn:\n  disabled: true\n", cli, root)
+	client, err := h.loader.Open(pluginFile{ID: "cpa-qoder", Path: os.Getenv("CPA_TEST_LIBRARY")}, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plugin, err := registerRPCPlugin(context.Background(), h, "cpa-qoder", client, pluginabi.MethodPluginRegister, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plugin.Capabilities.ResponseTranslator == nil {
+		t.Fatal("missing consumption translator")
+	}
+	streamID, chunks, cleanup := h.streams.open(context.Background())
+	defer cleanup()
+	_, err = callPlugin[rpcEmptyResponse](context.Background(), client, pluginabi.MethodExecutorExecuteStream, struct {
+		pluginapi.ExecutorRequest
+		StreamID string `json:"stream_id"`
+	}{pluginapi.ExecutorRequest{Model: "qoder/Auto", StorageJSON: []byte(`{"type":"qoder","variant":"global"}`), Payload: []byte(`{"messages":[{"role":"user","content":"Hello"}]}`)}, streamID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-chunks: // Withhold the response.translate receipt.
+	case <-time.After(3 * time.Second):
+		t.Fatal("native stream never started")
+	}
+	// Saturate the real, unchanged host queue, then wait for the old heartbeat
+	// to attempt a seventeenth emit. A fixed plugin waits locally for a receipt.
+	fillCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < streamBridgeBufferSize; i++ {
+		if err := h.streams.emit(fillCtx, streamID, pluginapi.ExecutorStreamChunk{Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(1200 * time.Millisecond)
+	done := make(chan struct{})
+	go func() { client.Shutdown(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		cleanup() // Release callbacks before failing the test.
+		<-done
+		t.Fatal("native unload blocked with a saturated host stream")
+	}
+	if instance := pluginCallbackInstance(client); instance == nil || !instance.closed.Load() {
+		t.Fatal("original loader did not close callbacks")
+	}
+}

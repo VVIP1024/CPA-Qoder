@@ -30,12 +30,7 @@ git -C ../CLIProxyAPI checkout 5be2cda
 
 已有兼容版本的源码时可直接使用。`../CLIProxyAPI` 是 Go 模块的构建依赖，插件安装完成后不要求保留源码。
 
-检查 CPA 源码是否已包含 [流关闭修复](patches/cpa-native-stream-cleanup.patch)。尚未包含时，将补丁应用到匹配版本的源码，再重新编译并替换 CPA 程序。
-
-```sh
-git -C /path/to/CLIProxyAPI apply --check /absolute/path/to/CPA-Qoder/patches/cpa-native-stream-cleanup.patch
-git -C /path/to/CLIProxyAPI apply /absolute/path/to/CPA-Qoder/patches/cpa-native-stream-cleanup.patch
-```
+兼容上述原版 CPA，无需修改或重新编译宿主程序。流输出与卸载清理由插件处理。
 
 ### 2. 安装插件文件
 
@@ -130,19 +125,22 @@ CPA 加载的插件 ID 是 `cpa-qoder`，模型提供方 ID 是 `qoder`。国际
 |---|---|
 | `AuthProvider` | 解析不含 token 的账号描述文件，导入已有 CLI 登录，并维护 CPA 的凭证检查时间。上游登录、签名和 token 刷新由 Qoder CLI 处理。 |
 | `ModelProvider` | 按账号调用 CLI 的 `--list-models`，缓存五分钟，分别注册 `qoder/` 和 `qoder-cn/` 模型。不会在两个区域之间切换账号。 |
-| `ProviderExecutor` | 接收和返回 Chat Completions，提供文本、流式内容、思考增量及原生函数调用交接；每次推理启动独立 CLI 进程。 |
+| `ProviderExecutor` | 接收 Chat Completions，经响应转换返回客户端格式，提供文本、流式内容、思考增量及原生函数调用交接；每次推理启动独立 CLI 进程。 |
 | `RequestInterceptor` | 在凭证选择前后为本插件的模型请求附加关联 ID，用于找到该请求启动的任务。 |
 | `RequestLifecyclePlugin` | 收到请求结束通知后，取消关联任务；客户端断开、请求失败时也走这条清理路径。 |
+| `ResponseTranslator` | 将插件内部输出转换为客户端格式。CPA 取走一块数据并调用转换后，插件才继续发送；取消等待无需进入宿主回调。转换前保留原始 usage 字段供 CPA 计量。 |
 
 注册时的 `executor_model_scope: oauth` 表示模型绑定 CPA 认证记录，不代表插件会发起浏览器 OAuth 登录。插件不承担 Agent 规划或工具执行。支持的参数与限制见下文“能力边界”。
+
+流输出使用内部格式 `cpa-qoder-chat`。每条流最多有一块数据等待 CPA 取走；`response.translate` 移除内部标记并确认消费。客户端变慢时，等待发生在插件内，关闭时可取消并等待任务退出。对外接口仍是 Chat Completions，其他入口协议使用 CPA SDK 的内置转换。
 
 ## CPA 加载插件的生命周期
 
 1. **选择动态库。** CPA 读取 `plugins.enabled`、`plugins.dir` 和 `plugins.configs.cpa-qoder`，按启用状态及版本选择 `cpa-qoder.dylib`、`.so` 或 `.dll`。`make install` 只是复制文件，实际加载发生在 CPA 应用插件配置时。
 2. **初始化原生接口。** CPA 打开动态库，调用 `cliproxy_plugin_init`，校验 C ABI 1，并交换调用、释放缓冲区及关闭回调。此时尚未启动推理 CLI。
-3. **注册插件。** CPA 调用 `plugin.register`，传入该插件的 YAML 配置。插件创建 `Provider`，返回元数据、配置字段和上述五项能力；CPA 校验 RPC schema 6 后，将这些能力放入运行时快照。
+3. **注册插件。** CPA 调用 `plugin.register`，传入该插件的 YAML 配置。插件创建 `Provider`，返回元数据、配置字段和上述六项能力；CPA 校验 RPC schema 6 后，将这些能力放入运行时快照。
 4. **载入账号和模型。** CPA 通过 `auth.parse` 解析 `oauth.auth-dir` 下的 `qoder-global.json`、`qoder-cn.json`。随后通过 `model.for_auth` 查询各账号可用模型，绑定到对应认证记录；`model.static` 不提供静态模型。目录缓存失效后，下次查询会重新启动发现进程。
-5. **处理模型请求。** CPA 运行请求拦截、选择认证记录，调用 `executor.execute` 或 `executor.execute_stream`。插件检查模型与账号是否匹配，在空临时目录启动对应 CLI。普通响应聚合为 JSON；流式响应通过 `host.stream.emit` 返回 JSON 增量，CPA 负责封装 SSE 和 `[DONE]`，插件最后调用 `host.stream.close`。有函数调用时，插件在 CLI 执行工具前停止进程，将调用交给外部 Agent。
+5. **处理模型请求。** CPA 运行请求拦截、选择认证记录，调用 `executor.execute` 或 `executor.execute_stream`。插件检查模型与账号是否匹配，在空临时目录启动对应 CLI。普通响应聚合为 JSON；流式响应通过 `host.stream.emit` 逐块发送，CPA 取走后调用 `response.translate`；插件收到确认后再发下一块，最后调用 `host.stream.close`。有函数调用时，插件在 CLI 执行工具前停止进程，将调用交给外部 Agent。
 6. **结束请求和检查凭证。** CPA 通过异步 `request.complete` 通知正常结束、失败或取消，插件按关联 ID 取消剩余任务，清理进程和临时目录。CPA 调用 `auth.refresh` 时，插件检查 CLI 账号文件并更新下次检查时间，不自行兑换上游 token。`auth.login.start/poll` 只导入已有登录。
 7. **重新应用配置。** 已注册实例收到 `plugin.reconfigure` 后，创建并切换到新的 `Provider`，取消旧实例中的任务并等待退出；进行中的请求可能因此中断。换用另一条动态库路径时，CPA 先向旧实例发送 `plugin.quiesce`，再注册新实例；旧库进入保留列表，最终卸载时关闭。
 8. **禁用、卸载或停止 CPA。** CPA 先从运行时快照移除插件能力，停止接收新调用，等待已进入的原生调用退出，再调用 C ABI 的 `shutdown` 回调。插件的 `Close()` 取消任务并等待工作协程结束，CPA 随后关闭库句柄。宿主等待超时后，清理可在后台继续。插件也处理 `plugin.shutdown` RPC，但当前原生加载器的最终关闭入口是 C 回调。
@@ -160,7 +158,7 @@ CPA 加载的插件 ID 是 `cpa-qoder`，模型提供方 ID 是 `qoder`。国际
 | `UsagePlugin` | 消费 CPA 已完成的用量记录，按区域和模型汇总。CLI 报告为 0 的 token 仍须保留为 0。 |
 | `AuthProvider` + `Scheduler` | 增加同一区域的多个账号，再按可用性或配额选择认证记录。需先扩展描述文件和账号配置；当前只有 Global/CN 两套固定账号，且两者模型命名空间隔离。 |
 | `ModelRouter` | 为已发现模型增加稳定别名或显式路由规则。跨区域切换需单独配置，不能绕过现有模型与账号校验。 |
-| `RequestTranslator` / `RequestNormalizer` / `ResponseTranslator` / `ResponseNormalizer` | 在 CPA 现有协议转换之外补充必要的字段映射。当前执行器只声明 Chat Completions 输入输出；增加转换不会让 CLI 自动支持图片或严格 Schema。 |
+| `RequestTranslator` / `RequestNormalizer` / `ResponseNormalizer` | 在 CPA 现有协议转换之外补充必要的字段映射。当前执行器接收 Chat Completions，并通过已有响应转换处理内部输出；增加转换不会让 CLI 自动支持图片或严格 Schema。 |
 | `CommandLinePlugin` | 增加登录检查、列出模型或生成描述文件的 CPA 命令行入口，复用现有发现和导入逻辑。 |
 
 ## 从源码单独试运行
@@ -226,8 +224,11 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 
 ```sh
 make test
+python3 scripts/check_host.py
 make build
 ```
+
+无需账号的端到端验证运行 `python3 scripts/smoke.py --fixture`，覆盖两套账号路径、超过宿主队列容量的流、函数交接和断开清理。原版 CPA 的满队列卸载测试使用临时 Go 覆盖文件，不修改宿主源码。
 
 真实账号端到端测试可运行 `python3 scripts/smoke.py`（macOS/Linux，需要两套 CLI 均已登录，会消耗少量真实模型额度）。脚本使用临时凭证副本并自动清理。
 

@@ -1,16 +1,20 @@
 # Integration test: uses existing encrypted CLI logins in temporary roots.
 # Requires make build server and consumes a few real model requests per account.
-import inspect,sys,socket,tempfile,pathlib,shutil,subprocess,urllib.request,urllib.error,json,time,os,signal
+import argparse,inspect,sys,socket,tempfile,pathlib,shutil,subprocess,urllib.request,urllib.error,json,time,os,signal
 
-def run(root):
+def run(root, fixture=False):
     base=pathlib.Path(__file__).resolve().parents[1]
     root.chmod(0o700)
     for variant,folder in [('global','.qoder'),('cn','.qoder-cn')]:
      dest=root/variant/'.auth';dest.mkdir(parents=True,mode=0o700)
-     for f in ['user','machine_id']:shutil.copyfile(pathlib.Path.home()/folder/'.auth'/f,dest/f);(dest/f).chmod(0o600)
+     for f in ['user','machine_id']:
+      if fixture:(dest/f).write_text('fixture')
+      else:shutil.copyfile(pathlib.Path.home()/folder/'.auth'/f,dest/f)
+      (dest/f).chmod(0o600)
     shutil.copytree(base/'auths',root/'auths')
     for variant,cli in [('global','qodercli'),('cn','qoderclicn')]:
-     executable=shutil.which(cli)
+     executable=str(base/'scripts/fixture_cli.py') if fixture else shutil.which(cli)
+     if fixture:pathlib.Path(executable).chmod(0o700)
      assert executable, f'{cli} not installed'
      wrapper=root/f'{variant}-cli'
      pidfile=root/f'{variant}.pid'
@@ -70,7 +74,7 @@ def run(root):
       body['stream']=True
       stream=request('/v1/chat/completions',body).read().decode();chunks=[json.loads(line[6:]) for line in stream.splitlines() if line.startswith('data: ') and '[DONE]' not in line]
       text=''.join(c['choices'][0]['delta'].get('content','') for c in chunks if c.get('choices'))
-      print('STREAM',model,'chunks',len(chunks),'text',repr(text),'done','[DONE]' in stream,flush=True);assert text.strip()=='OK' and '[DONE]' in stream
+      print('STREAM',model,'chunks',len(chunks),'text',repr(text),'done','[DONE]' in stream,flush=True);assert text.strip()=='OK' and stream.count('data: [DONE]')==1 and '_cpa_qoder_stream' not in stream
       body={'model':model,'messages':[{'role':'user','content':'Use weather to get the weather in Beijing.'}],'reasoning_effort':'none','tools':[{'type':'function','function':{'name':'weather','description':'Get weather for a city','parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}]}
       out=json.load(request('/v1/chat/completions',body));choice=out['choices'][0];print('TOOL',model,json.dumps(choice),flush=True);assert choice['finish_reason']=='tool_calls' and choice['message']['tool_calls'][0]['function']['name']=='weather'
       for name,parameters,prompt in [
@@ -124,8 +128,11 @@ def run(root):
 
 
 def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--fixture',action='store_true',help='Use a local CLI fixture without credentials or model quota')
+    args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='cpa-qoder-e2e-') as directory:
-        run(pathlib.Path(directory))
+        run(pathlib.Path(directory),args.fixture)
 
 
 if __name__ == '__main__':

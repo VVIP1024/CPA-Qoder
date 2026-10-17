@@ -1,7 +1,7 @@
 # Verification record
 
 Date: 2026-10-17. Host: macOS, arm64. Go: 1.26.4.
-CPA source: `5be2cda`, module `github.com/router-for-me/CLIProxyAPI/v8`, native ABI 1 / RPC schema 6.
+CPA source: `5be2cda`, module `github.com/router-for-me/CLIProxyAPI/v8`, native ABI 1 / RPC schema 6. The host source is unmodified.
 Both installed Qoder Global and QoderCN CLIs reported version 1.1.66.
 
 ## Automated checks
@@ -14,6 +14,8 @@ go test ./... -count=1
 go test -race ./... -count=1
 go vet ./...
 make build server
+python3 scripts/check_host.py
+python3 scripts/smoke.py --fixture
 
 # CLIProxyAPI/
 go test -race ./internal/pluginhost -count=1
@@ -22,13 +24,17 @@ git diff --check
 
 The sandbox runs used temporary Go caches under `/tmp` and `GOPROXY=https://goproxy.cn,direct`, because the default module proxy timed out. These environment settings are not required by the plugin itself.
 
-Regression coverage includes account and model namespace separation, missing credentials, complete text history, unsupported request rejection, explicit stdin, environment isolation, process cancellation during both discovery and silent generation, native tool handoff, empty argument deltas, truncated/error output, host wire method names, JSON stream chunks, terminal-chunk ordering, worker drain and cancellation during blocked host callbacks. Proxy configuration is verified at the subprocess boundary for discovery and generation.
+Regression coverage includes account and model namespace separation, missing credentials, complete text history, unsupported request rejection, explicit stdin, environment isolation, process cancellation during both discovery and silent generation, native tool handoff, empty argument deltas, truncated/error output, host wire method names, JSON stream chunks, terminal-chunk ordering, worker drain and cancellation while waiting for stream consumption. Proxy configuration is verified at the subprocess boundary for discovery and generation.
 
-The host regression fills the actual CPA executor stream queue, blocks another emit, closes the callback instance, rejects new emits, then permits only stream-close cleanup and verifies that the pending emit exits. It failed before the host fix and passed afterward. The plugin also independently tests shutdown with a silent child and a blocked callback.
+`python3 scripts/check_host.py` loads the native library into the original CPA loader using a temporary Go test overlay. It fills the real sixteen-slot stream queue, withholds the consumption receipt, and calls native shutdown. The original loader rejects all callbacks after closing the instance; the plugin cancels its local wait and returns without leaving callbacks behind. The overlay adds only a test in temporary storage; it does not edit CPA source.
 
-## Real account integration
+The fixture smoke repeats both Global and CN paths on the unmodified host: model registration, ordinary and streamed completions, 64 reasoning deltas per response, native function-call handoff, tool-result followup and disconnect cleanup. It uses dummy auth files and a local CLI protocol fixture.
+
+## Earlier real account integration
 
 `python3 scripts/smoke.py` starts the built CPA with its native plugin on a temporary localhost port. It copies only the encrypted CLI login files into private temporary roots and removes them afterward, including on setup failure. Test-only wrappers record child PIDs without printing credentials or modifying either installed CLI.
+
+These live-account results were recorded before the stream transport change. The current transport was rechecked with fixtures on the original host; live quota was not used for that recheck.
 
 The account catalog advertised 17 Global models and one CN model during this run. Actual model permissions can change. Real generation tests selected `Qwen3.8-Flash` from each namespace:
 
@@ -46,9 +52,7 @@ The helper never implemented either function. The external test client supplied 
 
 ## Review and limits
 
-Independent design and code reviews were completed. Findings concerning worker drain, empty streamed arguments and proxy propagation were resolved, together with integration findings concerning SSE framing, interceptor names, terminal ordering and CPA's closed-instance cleanup guard.
-
-The portable host compatibility change is in `patches/cpa-native-stream-cleanup.patch`; it matches the two modified upstream files and was checked with a reverse dry run against this workspace.
+Independent design and code reviews were completed. Findings concerning worker drain, empty streamed arguments and proxy propagation were resolved, together with integration findings concerning SSE framing, interceptor names, terminal ordering and plugin-side stream consumption control.
 
 Verified platform: macOS arm64. Linux/Windows process handling and other CPA entry-protocol translations were not exercised end to end. Only the two listed models received real generation tests; the catalog lists the remaining models without claiming they were all invoked. Real proxy connectivity, token expiry and long-running load were not simulated.
 

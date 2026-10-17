@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,83 +121,6 @@ func TestCloseWaitsForCanceledWorkers(t *testing.T) {
 	}
 }
 
-func TestStreamShutdownDrainsCallbacks(t *testing.T) {
-	for _, blocked := range []bool{false, true} {
-		t.Run(fmt.Sprint("backpressure=", blocked), func(t *testing.T) {
-			p := testProvider(t)
-			_ = os.WriteFile(filepath.Join(p.cfg.Global.ConfigDir, "block"), nil, 0600)
-			original := callHost
-			var closed atomic.Bool
-			var callbacks atomic.Int32
-			started := make(chan struct{}, 1)
-			released := make(chan struct{})
-			callHost = func(method string, payload any) (json.RawMessage, error) {
-				callbacks.Add(1)
-				defer callbacks.Add(-1)
-				if method == "host.stream.close" {
-					if !closed.CompareAndSwap(false, true) {
-						t.Error("stream closed twice")
-					}
-					close(released)
-					return nil, nil
-				}
-				if method == "host.stream.emit" {
-					select {
-					case started <- struct{}{}:
-					default:
-					}
-					if blocked {
-						<-released
-						return nil, fmt.Errorf("stream closed")
-					}
-					return nil, nil
-				}
-				return nil, fmt.Errorf("unexpected host callback")
-			}
-			defer func() { callHost = original }()
-			req := runRequest()
-			raw, _ := json.Marshal(struct {
-				pluginapi.ExecutorRequest
-				StreamID string `json:"stream_id"`
-			}{req, "stream"})
-			if _, err := startStream(p, raw); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case <-started:
-			case <-time.After(5 * time.Second):
-				t.Fatal("stream never started")
-			}
-			if !blocked {
-				deadline := time.After(5 * time.Second)
-				for {
-					if _, err := os.Stat(filepath.Join(p.cfg.Global.ConfigDir, "invocation.json")); err == nil {
-						break
-					}
-					select {
-					case <-deadline:
-						t.Fatal("silent child never started")
-					case <-time.After(time.Millisecond):
-					}
-				}
-			}
-			done := make(chan struct{})
-			go func() { p.Close(); close(done) }()
-			select {
-			case <-done:
-			case <-time.After(3 * time.Second):
-				t.Fatal("shutdown stuck with active callbacks")
-			}
-			if !closed.Load() || callbacks.Load() != 0 {
-				t.Fatal("shutdown returned before host callbacks drained")
-			}
-			if _, _, err := p.track(context.Background(), "late"); err == nil {
-				t.Fatal("closed provider accepted work")
-			}
-		})
-	}
-}
-
 func TestFinishChunkRemainsLastWithSlowHost(t *testing.T) {
 	p := testProvider(t)
 	original := callHost
@@ -218,6 +140,8 @@ func TestFinishChunkRemainsLastWithSlowHost(t *testing.T) {
 				sawFinish.Store(true)
 				<-time.After(1100 * time.Millisecond)
 			}
+			_, err := translateResponse(pluginapi.ResponseTransformRequest{FromFormat: transportFormat, ToFormat: "openai", Stream: true, Body: raw})
+			return nil, err
 		}
 		return nil, nil
 	}

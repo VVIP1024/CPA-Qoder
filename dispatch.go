@@ -70,7 +70,7 @@ func dispatch(method string, raw []byte) ([]byte, error) {
 		if old := current.Swap(p); old != nil {
 			old.Close()
 		}
-		return marshal(map[string]any{"schema_version": pluginabi.SchemaVersion, "metadata": pluginapi.Metadata{Name: "CPA-Qoder", Version: "0.1.0", Author: "CPA-Qoder contributors", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{{Name: "global", Type: pluginapi.ConfigFieldTypeObject, Description: "International CLI, config-dir and disabled settings"}, {Name: "cn", Type: pluginapi.ConfigFieldTypeObject, Description: "China CLI, config-dir and disabled settings"}, {Name: "proxy-url", Type: pluginapi.ConfigFieldTypeString, Description: "Explicit proxy for both CLI discovery and generation; otherwise inherit CLI environment"}, {Name: "helper", Type: pluginapi.ConfigFieldTypeString, Description: "Absolute path to cpa-qoder-helper for external function calling"}}}, "capabilities": map[string]any{"auth_provider": true, "model_provider": true, "executor": true, "executor_model_scope": "oauth", "executor_input_formats": []string{"chat-completions"}, "executor_output_formats": []string{"chat-completions"}, "request_interceptor": true, "request_lifecycle_plugin": true}})
+		return marshal(map[string]any{"schema_version": pluginabi.SchemaVersion, "metadata": pluginapi.Metadata{Name: "CPA-Qoder", Version: "0.1.0", Author: "CPA-Qoder contributors", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{{Name: "global", Type: pluginapi.ConfigFieldTypeObject, Description: "International CLI, config-dir and disabled settings"}, {Name: "cn", Type: pluginapi.ConfigFieldTypeObject, Description: "China CLI, config-dir and disabled settings"}, {Name: "proxy-url", Type: pluginapi.ConfigFieldTypeString, Description: "Explicit proxy for both CLI discovery and generation; otherwise inherit CLI environment"}, {Name: "helper", Type: pluginapi.ConfigFieldTypeString, Description: "Absolute path to cpa-qoder-helper for external function calling"}}}, "capabilities": map[string]any{"auth_provider": true, "model_provider": true, "executor": true, "executor_model_scope": "oauth", "executor_input_formats": []string{"chat-completions"}, "executor_output_formats": []string{transportFormat}, "response_translator": true, "request_interceptor": true, "request_lifecycle_plugin": true}})
 	}
 	p := provider()
 	if p == nil {
@@ -191,6 +191,16 @@ func dispatch(method string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		return marshal(pluginapi.ExecutorResponse{Payload: completionJSON(req.Model, id, created, out), Headers: http.Header{"Content-Type": []string{"application/json"}}})
+	case "response.translate":
+		var req pluginapi.ResponseTransformRequest
+		if err := decode(raw, &req); err != nil {
+			return nil, err
+		}
+		out, err := translateResponse(req)
+		if err != nil {
+			return nil, err
+		}
+		return marshal(out)
 	case "executor.execute_stream":
 		return startStream(p, raw)
 	case "executor.count_tokens":
@@ -226,8 +236,14 @@ func startStream(p *Provider, raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	delivery, err := openStreamDelivery(req.StreamID)
+	if err != nil {
+		untrack()
+		return nil, err
+	}
 	go func() {
 		defer untrack()
+		defer streamDeliveries.Delete(req.StreamID)
 		ctx, cancel := context.WithCancel(streamCtx)
 		defer cancel()
 		errMessage := ""
@@ -269,11 +285,11 @@ func startStream(p *Provider, raw []byte) ([]byte, error) {
 				return nil
 			}
 			terminal = final
-			_, err := callHost("host.stream.emit", map[string]any{"stream_id": req.StreamID, "payload": payload})
-			return err
+			return delivery.send(ctx, payload, final)
 		}
 		emit := func(payload []byte) error { return emitChunk(payload, false) }
-		// Valid empty deltas let the host reject canceled streams during upstream silence.
+		// Empty deltas detect disconnected clients during upstream silence.
+		// They share the same consumption window as content.
 		go func() {
 			defer close(heartbeatDone)
 			ticker := time.NewTicker(time.Second)
