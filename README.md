@@ -2,168 +2,124 @@
 
 English | [简体中文](README_CN.md)
 
-A standalone native CLIProxyAPI plugin providing model inference through existing Qoder Global and QoderCN CLI logins. External CPA clients own Agent planning, function execution and subsequent turns.
+CPA-Qoder is a native model-provider plugin for CPA. It uses existing Qoder Global and QoderCN CLI logins, registers their models under `qoder/*` and `qoder-cn/*`, and exposes completions, streaming, and function-call handoff through CPA.
 
-See [中文使用说明](README_CN.md) for setup, configuration, examples and limitations.
+The external CPA client remains responsible for tool execution, planning, and the Agent loop.
 
-## Install into an existing CPA
+## Compatibility and repository boundary
 
-This installs `cpa-qoder` into CPA's local plugin list. Use your existing CPA server, endpoint and client keys. `make run` starts a separate development server and is not required for installation.
+- Native plugin C ABI 1 and RPC schema 6, built against the published CPA v8.0.0 SDK.
+- Linux release packages target Debian Bookworm/glibc and are available for amd64 and arm64.
+- `qodercli` and `qoderclicn` are supported together, with separate credentials and model namespaces.
+- This repository has no Git submodule, local module replacement, sibling source-tree reference, or host patch. Builds download the published Go SDK module. A deployed package needs neither Go nor either source tree.
 
-### 1. Prepare the runtime
+## Build a release package
 
-The plugin was verified against CPA commit `5be2cda`, C ABI 1 / RPC schema 6. Build with Go 1.26+, a C compiler and the matching CPA source at `../CLIProxyAPI` (the local module replacement). Build for the same OS and CPU as the CPA process.
-
-Install and log into `qodercli` and `qoderclicn` on the CPA machine as the service's OS user. For containers, install the CLIs inside the container and make login directories accessible there. Host CLI paths and libraries for another OS cannot be reused directly.
-
-If the CPA source is not already available, prepare it from this repository root:
-
-```sh
-git clone https://github.com/router-for-me/CLIProxyAPI.git ../CLIProxyAPI
-git -C ../CLIProxyAPI checkout 5be2cda
-```
-
-Use an existing compatible checkout instead when available. The Go module imports CPA's plugin SDK through the `../CLIProxyAPI` replacement; the source directory is a build dependency, not a runtime requirement.
-
-Works with the original CPA version above. The plugin handles stream backpressure and unload; no host changes or rebuild are required.
-
-### 2. Install the files
-
-Stop CPA. From the `CPA-Qoder` source directory, replace the paths below with the existing `plugins.dir` and `oauth.auth-dir`:
+Only Docker is required on the build machine:
 
 ```sh
-make install PLUGIN_DIR=/path/to/cpa/plugins AUTH_DIR=/path/to/cpa/auths
-mkdir -p /path/to/cpa/plugin-bin
-cp build/cpa-qoder-helper /path/to/cpa/plugin-bin/cpa-qoder-helper
-chmod 755 /path/to/cpa/plugin-bin/cpa-qoder-helper
+make release-linux-amd64  # common x86_64 servers
+make release-linux-arm64  # ARM64 servers
 ```
 
-This installs `plugins/cpa-qoder.dylib` (Linux: `.so`), `auths/qoder-global.json` and `auths/qoder-cn.json`. Existing descriptors are preserved. Copy the helper separately as shown; the source `build` directory is then unnecessary at runtime. Generated C headers do not need installation.
+The archive and checksum are written to `dist/`. Each archive contains:
 
-Only keep descriptors for accounts you use and disable unused variants. Descriptors contain `type` and `variant`, never tokens. Do not replace them with Qoder's encrypted `user` file.
+```text
+cpa-qoder-linux-<arch>/
+├── plugins/cpa-qoder.so
+├── bin/cpa-qoder-helper
+├── auths/qoder-global.json
+├── auths/qoder-cn.json
+├── config.example.yaml
+└── INSTALL.md
+```
 
-### 3. Merge CPA configuration
+Plain `make` builds the amd64 package. Compilation runs in `golang:1.26-bookworm` with an explicit Linux target, so the build machine's operating system and CPU do not change the artifact format.
 
-Merge these fields into the existing configuration, keeping other plugins, server settings and client keys. Keep the existing auth directory. Replace all example paths; use absolute CLI paths from `command -v qodercli` and `command -v qoderclicn` under the service user.
+## Install in a Docker CPA deployment
+
+The package contains the plugin, helper, account descriptors, and configuration fragment. It cannot redistribute the Qoder CLIs or your credentials. Install the Linux versions of `qodercli` and `qoderclicn` in the CPA container, and persist `/root/.qoder` and `/root/.qoder-cn` so the CLIs can refresh their login state.
+
+Extract the package that matches the server CPU, then add these mounts to the CPA Compose service:
 
 ```yaml
-oauth:
-  auth-dir: /path/to/cpa/auths
-plugins:
-  enabled: true
-  dir: /path/to/cpa/plugins
-  configs:
-    cpa-qoder:
-      enabled: true
-      priority: 1
-      helper: /path/to/cpa/plugin-bin/cpa-qoder-helper
-      proxy-url: ""
-      global:
-        cli: /absolute/path/to/qodercli
-        config-dir: /home/cpa/.qoder
-        disabled: false
-      cn:
-        cli: /absolute/path/to/qoderclicn
-        config-dir: /home/cpa/.qoder-cn
-        disabled: false
+services:
+  cpa:
+    volumes:
+      - ./cpa-qoder-linux-amd64/plugins/cpa-qoder.so:/CLIProxyAPI/plugins/cpa-qoder.so:ro
+      - ./cpa-qoder-linux-amd64/bin/cpa-qoder-helper:/CLIProxyAPI/plugin-bin/cpa-qoder-helper:ro
+      - ./cpa-qoder-linux-amd64/auths/qoder-global.json:/root/.cli-proxy-api/qoder-global.json:ro
+      - ./cpa-qoder-linux-amd64/auths/qoder-cn.json:/root/.cli-proxy-api/qoder-cn.json:ro
+      - ./qoder-home:/root/.qoder
+      - ./qodercn-home:/root/.qoder-cn
 ```
 
-`/home/cpa` stands for the service user's home (usually `/Users/<user>` on macOS). That user must be able to read login files and execute both CLIs and the helper.
+The descriptor mounts above use the official Docker default auth directory, `/root/.cli-proxy-api`. If your existing `oauth.auth-dir` differs, change both mount targets to that directory. Keep the current auth directory so existing CPA accounts remain visible.
 
-### 4. Check the CPA plugin list
+The example expects the CLIs at `/usr/local/bin/qodercli` and `/usr/local/bin/qoderclicn`. Bake their full Linux installations into your CPA image, or mount them at those paths. Merge `config.example.yaml` into the existing CPA configuration; keep the server, access-key, auth-directory, and unrelated plugin settings already in that file.
 
-Restart your existing CPA service and refresh its plugin list. Look for ID `cpa-qoder`, name `CPA-Qoder`. With management access already configured, check the same state through:
+With persistent login directories mounted, login from the container:
 
 ```sh
-curl http://127.0.0.1:8317/v8/management/plugins \
-  -H 'Authorization: Bearer YOUR_MANAGEMENT_KEY'
-curl http://127.0.0.1:8317/v1/models \
-  -H 'Authorization: Bearer YOUR_CLIENT_API_KEY'
+docker exec -it <cpa-container> qodercli login
+docker exec -it <cpa-container> qoderclicn login
 ```
 
-Expect `plugins_enabled: true` and the plugin's `registered`, `enabled` and `effective_enabled` all true. A discovered file alone does not confirm registration. The model list should contain the configured accounts' `qoder/` and `qoder-cn/` models. Management and client keys serve different purposes. If registration succeeds but models are missing, check the actual auth directory, service user's CLI login and connectivity.
+Restart CPA and query `/v1/models`. Global models appear as `qoder/<model>` and China models as `qoder-cn/<model>`. If only one account is used, remove the other descriptor and set that variant's `disabled` field to `true`.
 
-This repository currently documents installation from source. CPA's store requires downloadable native libraries and registry metadata; it cannot import this source directory or the helper as a plugin package.
+See [INSTALL.md](INSTALL.md) for the same deployment steps included in the release archive.
 
-Use an exact model name returned by `/v1/models` in a Chat Completions request:
+## Features
 
-```sh
-curl http://127.0.0.1:8317/v1/chat/completions \
-  -H 'Authorization: Bearer YOUR_CLIENT_API_KEY' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qoder/MODEL_FROM_LIST","messages":[{"role":"user","content":"Hello"}],"stream":true}'
-```
-
-### Update or disable
-
-Stop CPA before replacing the library and helper, then restart. To disable, set `plugins.configs.cpa-qoder.enabled: false`, or use the current management API:
-
-```sh
-curl -X PUT http://127.0.0.1:8317/v8/management/config/plugins/configs/cpa-qoder/enabled \
-  -H 'Authorization: Bearer YOUR_MANAGEMENT_KEY' \
-  -H 'Content-Type: application/json' -d 'false'
-```
-
-Use `true` to re-enable and keep `plugins.enabled: true`. To remove completely, stop CPA and remove this library, helper, descriptors and configuration entry. Keep the original CLI login directories.
-
-For a development server, use `make run`. Its example client key must be replaced for normal use.
-
-Both accounts are isolated: `qoder/<CLI model name>` uses `qodercli` with `~/.qoder`; `qoder-cn/<CLI model name>` uses `qoderclicn` with `~/.qoder-cn`. Models are discovered per account. Token-free descriptors in `auths/` activate the accounts through CPA's AuthProvider interface.
-
-Function calling uses native model tool-use events through a schema-only MCP helper. The plugin stops the CLI before function execution and returns OpenAI tool calls; the helper never implements or executes functions. Textual history and tool results are replayed as role-labelled JSON text, with system instructions provided separately. This is a CLI transport, not direct access to Qoder's private model protocol, and native message semantics are not identical. Unsupported controls and modalities are rejected explicitly.
-
-## Supported requests and limits
-
-Text input, streamed text/reasoning, external function declarations and tool-result history are supported. Generation controls include `max_tokens` / `max_completion_tokens`, the CLI's `reasoning_effort`, and `tool_choice: auto|none`, subject to model support.
-
-Images/audio, forced or required tool choice, strict tool schemas, `temperature`, `top_p`, `stop` and JSON Schema output are rejected. History is replayed as role-labelled text; native provider message semantics, signed reasoning and cache state are not preserved between requests. Usage reflects CLI-reported values, including zero counts from some models, without estimates.
-
-## Implemented CPA interfaces
-
-The plugin ID is `cpa-qoder`; its provider ID is `qoder`. Global and CN accounts share one library and use separate descriptor variants.
-
-| Interface | Current behavior |
+| Capability | Behavior |
 |---|---|
-| `AuthProvider` | Parses token-free descriptors, imports existing CLI logins and schedules CPA credential checks. Qoder CLI owns upstream authentication, signing and token refresh. |
-| `ModelProvider` | Runs `--list-models` per account with a five-minute cache. Registers separate `qoder/` and `qoder-cn/` namespaces without cross-region fallback. |
-| `ProviderExecutor` | Accepts Chat Completions and converts executor output to the client protocol: text, streaming content, reasoning deltas and native function-call handoff. Each inference starts a separate CLI process. |
-| `RequestInterceptor` | Adds a request correlation ID before and after credential selection for matching model names. |
-| `RequestLifecyclePlugin` | Cancels remaining work when CPA reports completion, failure or cancellation. |
-| `ResponseTranslator` | Converts the private executor format to the client protocol and acknowledges each consumed chunk. Cancellation releases the local wait without a native callback. Raw usage fields remain available to CPA accounting. |
+| `AuthProvider` | Parses both account descriptors and checks CLI login files. The official CLIs retain credential, signing, and refresh ownership. |
+| `ModelProvider` | Discovers models for each account with a five-minute cache and keeps the two namespaces separate. |
+| `ProviderExecutor` | Handles Chat Completions, normal and SSE output, reasoning deltas, and native function-call handoff. Each inference gets its own CLI process. |
+| `RequestInterceptor` | Carries the CPA request ID for matching Qoder requests. |
+| `RequestLifecyclePlugin` | Stops outstanding CLI work when CPA reports completion, failure, or cancellation. |
+| `ResponseTranslator` | Converts the internal transport to CPA client protocols and applies stream backpressure. |
 
-The declared `executor_model_scope: oauth` binds models to CPA auth records; it does not start a browser OAuth flow. Exact token counting and arbitrary authenticated HTTP requests return 501.
+`proxy-url` sets the proxy used for discovery and generation. When empty, the CLI inherits `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` from the container.
 
-Streams use the private `cpa-qoder-chat` format. Each stream waits for CPA to consume and translate one chunk before sending another. The wait is local and cancelable; the translator removes internal markers before delivery. Chat Completions remains the public contract; other entry protocols use the CPA SDK built-in translators.
+## CPA plugin lifecycle
 
-## CPA load and request lifecycle
+1. CPA scans `plugins.dir` and selects `cpa-qoder.so` when `plugins.configs.cpa-qoder.enabled` is true.
+2. CPA opens the library, calls `cliproxy_plugin_init`, checks the C ABI, and exchanges call, memory-release, and shutdown callbacks. No Qoder process starts yet.
+3. `plugin.register` parses the YAML configuration, creates the Provider, and returns metadata, fields, and capabilities.
+4. `auth.parse` creates Global and CN auth records from descriptors in `oauth.auth-dir`.
+5. `model.for_auth` runs discovery through the matching CLI and binds its models to that auth record.
+6. CPA translates the incoming request, selects credentials, and calls `executor.execute` or `executor.execute_stream`. Function calls are returned to the external Agent.
+7. Completion and cancellation events remove subprocesses and temporary files. Reconfiguration drains the old Provider before replacement.
+8. On disable or shutdown, CPA blocks new calls, waits for native calls, invokes the shutdown callback, and unloads the library.
 
-1. **Select the library.** CPA reads `plugins.enabled`, `plugins.dir` and `plugins.configs.cpa-qoder`, then selects an enabled library/version (`cpa-qoder.dylib`, `.so` or `.dll`). Installation copies files; loading happens when CPA applies plugin configuration.
-2. **Initialize the native interface.** CPA opens the library and calls `cliproxy_plugin_init`, checks C ABI 1, and exchanges call, buffer-free and shutdown callbacks. No inference CLI starts at this stage.
-3. **Register capabilities.** CPA sends the plugin YAML through `plugin.register`. The plugin creates a `Provider` and returns metadata, configuration fields and the six capabilities above. CPA validates RPC schema 6 and publishes the capabilities in its runtime snapshot.
-4. **Load accounts and models.** `auth.parse` reads `qoder-global.json` and `qoder-cn.json` from `oauth.auth-dir`. `model.for_auth` discovers models and binds them to each auth record. `model.static` contributes no static models. After the catalog cache expires, the next lookup runs discovery again.
-5. **Execute a request.** CPA runs interception, selects an auth record and calls `executor.execute` or `executor.execute_stream`. The plugin validates the account/model pair and starts the matching CLI in an empty temporary directory. Non-streaming output becomes a JSON response. Streaming JSON deltas go through `host.stream.emit`; CPA acknowledges consumption through `response.translate` before the next chunk is sent. The plugin ends with `host.stream.close`. Native function calls stop the CLI before tool execution and return to the external Agent.
-6. **Finish work and check credentials.** Asynchronous `request.complete` events cancel remaining tasks by request ID; processes and temporary files are cleaned up. `auth.refresh` checks CLI account files and renews CPA's check schedule. It does not exchange upstream tokens. `auth.login.start/poll` only imports an existing CLI login.
-7. **Reapply configuration.** `plugin.reconfigure` creates and swaps in a new `Provider`, cancels old tasks and waits for them to exit. In-flight requests can be interrupted. When replacing a library path, CPA first sends `plugin.quiesce` to the old instance and registers the new one; the old library remains retired until final unload.
-8. **Disable, unload or stop CPA.** CPA removes the plugin from its runtime snapshot, stops new calls, waits for active native calls and invokes the C ABI shutdown callback. `Close()` cancels tasks and joins workers before CPA closes the library handle. Cleanup may continue in the background after the host's wait context expires. The dispatcher also accepts `plugin.shutdown`, but this native loader uses the C callback for final shutdown.
+## CPA extension points
 
-Source: [native entrypoint](native.go), [RPC dispatch](dispatch.go), [worker lifecycle](config.go), [CLI runner](runner.go); CPA's `internal/pluginhost/host.go`, `internal/pluginhost/loader_unix.go` and `internal/pluginhost/client_guard.go`.
-
-## Further CPA extension points
-
-These additions are not implemented. Interfaces are defined in `sdk/pluginapi/types.go` in a compatible [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) checkout. Each addition needs a capability declaration, RPC handlers and verification.
-
-| Extension | Possible addition and requirements |
+| Extension | Possible addition |
 |---|---|
-| `ManagementAPI` / `ManagementHandler` | CLI version, per-region login checks, discovery errors and catalog refresh. Return status without exposing credentials. |
-| `QuotaProvider` | Per-region balance or quota, once a supported CLI or official query interface is available. Token usage cannot establish remaining balance. |
-| `UsagePlugin` | Aggregate completed CPA usage records by region/model; preserve zero token counts reported by the CLI. |
-| `AuthProvider` + `Scheduler` | Multiple accounts within one region, followed by availability/quota-based selection. Requires extending account configuration and descriptors; today's fixed Global/CN accounts have disjoint model namespaces. |
-| `ModelRouter` | Stable aliases and explicit routing to discovered models. Cross-region routing requires its own configuration and must retain account/model checks. |
-| `RequestTranslator` / `RequestNormalizer` / `ResponseNormalizer` | Additional field mappings beyond CPA's existing translation. The executor accepts Chat Completions and converts its private output format; translation alone cannot add CLI support for images or strict schemas. |
-| `CommandLinePlugin` | CPA flags for login checks, model discovery or descriptor generation, using the existing import and discovery code. |
+| `ManagementAPI` / `ManagementHandler` | CLI versions, login health, discovery errors, and catalog refresh. |
+| `QuotaProvider` | Per-region quota if a stable supported query becomes available. |
+| `UsagePlugin` | Completed-request usage grouped by region and model. |
+| `AuthProvider` + `Scheduler` | Multiple accounts in one region with availability or quota scheduling. |
+| `ModelRouter` | Stable aliases and explicit routes while preserving account checks. |
+| `RequestTranslator` / `ResponseNormalizer` | Images, structured output, and other mappings when the CLI supports those semantics. |
+| `CommandLinePlugin` | Login checks, model refresh, and descriptor generation commands. |
 
-## Verification
+These extensions are not implemented. Each one needs a capability declaration, RPC handlers, and host compatibility coverage.
 
-Run `make test` for unit and race checks. After building, run `python3 scripts/check_host.py` to check native unload on the original host, and `python3 scripts/smoke.py --fixture` for both account paths without credentials or model quota. See [architecture](docs/architecture.md) and [verification](docs/verification.md).
+## Development and verification
 
-Set `plugins.configs.cpa-qoder.proxy-url` for the CLI transport proxy, including discovery and generation. Empty inherits CLI proxy environment variables. CPA’s general HTTP proxy setting does not automatically reach CLI subprocesses.
+Local development builds require Go 1.26 and a C compiler:
+
+```sh
+make build
+make test
+```
+
+The end-to-end fixture accepts an existing CPA executable and does not inspect a sibling source tree:
+
+```sh
+python3 scripts/smoke.py --fixture --cpa-binary /path/to/cli-proxy-api
+```
+
+See [architecture](docs/architecture.md) and [verification](docs/verification.md). The current public CLI is text-oriented; image input, forced tool choice, strict structured output, and some generation controls are not supported.

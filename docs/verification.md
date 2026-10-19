@@ -1,59 +1,51 @@
 # Verification record
 
-Date: 2026-10-17. Host: macOS, arm64. Go: 1.26.4.
-CPA source: `5be2cda`, module `github.com/router-for-me/CLIProxyAPI/v8`, native ABI 1 / RPC schema 6. The host source is unmodified.
-Both installed Qoder Global and QoderCN CLIs reported version 1.1.66.
+Date: 2026-10-19. Local host: macOS arm64. Plugin SDK: CPA v8.0.0, native ABI 1, RPC schema 6.
 
-## Automated checks
+## Independent repository check
 
-All of the following completed successfully:
+The repository was copied to a new temporary directory with no adjacent CPA checkout. From that directory, a clean module cache completed:
 
 ```sh
-# CPA-Qoder/
-go test ./... -count=1
-go test -race ./... -count=1
+go test -race ./...
 go vet ./...
-make build server
-python3 scripts/check_host.py
-python3 scripts/smoke.py --fixture
-
-# CLIProxyAPI/
-go test -race ./internal/pluginhost -count=1
-git diff --check
+go build -buildmode=c-shared .
+go build .
 ```
 
-The sandbox runs used temporary Go caches under `/tmp` and `GOPROXY=https://goproxy.cn,direct`, because the default module proxy timed out. These environment settings are not required by the plugin itself.
+The build resolved `github.com/router-for-me/CLIProxyAPI/v8 v8.0.0` from the module proxy. `go.mod` contains no local `replace`, and the checksum entries are committed in `go.sum`.
 
-Regression coverage includes account and model namespace separation, missing credentials, complete text history, unsupported request rejection, explicit stdin, environment isolation, process cancellation during both discovery and silent generation, native tool handoff, empty argument deltas, truncated/error output, host wire method names, JSON stream chunks, terminal-chunk ordering, worker drain and cancellation while waiting for stream consumption. Proxy configuration is verified at the subprocess boundary for discovery and generation.
+The repository was also scanned for parent-directory CPA references, local module replacements, old host-build commands, and references to other plugin repositories. None remain.
 
-`python3 scripts/check_host.py` loads the native library into the original CPA loader using a temporary Go test overlay. It fills the real sixteen-slot stream queue, withholds the consumption receipt, and calls native shutdown. The original loader rejects all callbacks after closing the instance; the plugin cancels its local wait and returns without leaving callbacks behind. The overlay adds only a test in temporary storage; it does not edit CPA source.
+## Host compatibility fixture
 
-The fixture smoke repeats both Global and CN paths on the unmodified host: model registration, ordinary and streamed completions, 64 reasoning deltas per response, native function-call handoff, tool-result followup and disconnect cleanup. It uses dummy auth files and a local CLI protocol fixture.
+A current CPA executable was built into `/tmp`; its source tree was not edited. The plugin was then built locally and tested with:
 
-## Earlier real account integration
+```sh
+python3 scripts/smoke.py --fixture --cpa-binary /tmp/cli-proxy-api-qoder-test
+```
 
-`python3 scripts/smoke.py` starts the built CPA with its native plugin on a temporary localhost port. It copies only the encrypted CLI login files into private temporary roots and removes them afterward, including on setup failure. Test-only wrappers record child PIDs without printing credentials or modifying either installed CLI.
+The fixture passed for both `qoder/Qwen3.8-Flash` and `qoder-cn/Qwen3.8-Flash`:
 
-These live-account results were recorded before the stream transport change. The current transport was rechecked with fixtures on the original host; live quota was not used for that recheck.
+- model discovery and namespace separation;
+- non-streaming and SSE responses;
+- reasoning deltas;
+- native function calls with arguments and an empty argument object;
+- external tool-result follow-up;
+- cancellation and child-process cleanup after an HTTP disconnect.
 
-The account catalog advertised 17 Global models and one CN model during this run. Actual model permissions can change. Real generation tests selected `Qwen3.8-Flash` from each namespace:
+Unit and race coverage also exercises missing credentials, unsupported inputs, environment isolation, discovery and generation cancellation, truncated CLI output, stream ordering, backpressure, worker drain, and shutdown while a stream is waiting for consumption.
 
-| Check | `qoder/Qwen3.8-Flash` | `qoder-cn/Qwen3.8-Flash` |
-|---|---|---|
-| Non-stream completion returns `OK` | Passed | Passed |
-| Text SSE reconstructs `OK`, with one DONE marker | Passed | Passed |
-| Native `weather` call returns `finish_reason=tool_calls` | Passed | Passed |
-| Streamed weather arguments reconstruct valid JSON | Passed | Passed |
-| Zero-argument `ping` stream reconstructs `{}` | Passed | Passed |
-| External tool result is used in the next answer | Passed | Passed |
-| HTTP disconnect terminates and reaps the actual CLI child | Passed | Passed |
+## Linux release packages
 
-The helper never implemented either function. The external test client supplied the weather result. Both observed token usage reports were zero; the plugin preserves those upstream values.
+`make release-linux-amd64` and `make release-linux-arm64` run inside `golang:1.26-bookworm`, force the requested Linux platform, and write a fixed `.so` name. The packaging step checks that the library is non-empty and the helper is executable before creating the archive and SHA-256 file.
 
-## Review and limits
+The GitHub Actions workflow builds both architectures on Ubuntu with QEMU enabled. A tag matching `v*` publishes both archives and checksums to the matching GitHub Release; a manual run keeps them as workflow artifacts.
 
-Independent design and code reviews were completed. Findings concerning worker drain, empty streamed arguments and proxy propagation were resolved, together with integration findings concerning SSE framing, interceptor names, terminal ordering and plugin-side stream consumption control.
+The local sandbox could not start Apple virtualization, so no local Linux archive was produced during this review. The workflow performs the real Linux compilation before any release asset is published.
 
-Verified platform: macOS arm64. Linux/Windows process handling and other CPA entry-protocol translations were not exercised end to end. Only the two listed models received real generation tests; the catalog lists the remaining models without claiming they were all invoked. Real proxy connectivity, token expiry and long-running load were not simulated.
+## Limits
 
-The transport reuses the official CLI login, refresh and signing behavior. It does not implement Qoder's private HTTP protocol. History and external tool results are role-labelled JSON text; their native upstream message semantics are not identical. Unsupported controls and modalities are explicitly rejected. Agent planning and tool execution remain the responsibility of the external CPA client.
+The fixture validates the CPA/plugin boundary without consuming a Qoder account quota. Live deployment still requires Linux installations of both Qoder CLIs and valid login directories inside the CPA container.
+
+The public CLI is text-oriented. Multi-turn messages are replayed as role-labelled text. Image input, forced tool choice, strict structured output, and unsupported generation controls are rejected rather than silently changed.

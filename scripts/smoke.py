@@ -1,8 +1,8 @@
-# Integration test: uses existing encrypted CLI logins in temporary roots.
-# Requires make build server and consumes a few real model requests per account.
+# Integration test: uses an existing CPA executable and temporary login roots.
+# Real-account mode consumes a few model requests per account.
 import argparse,inspect,sys,socket,tempfile,pathlib,shutil,subprocess,urllib.request,urllib.error,json,time,os,signal
 
-def run(root, fixture=False):
+def run(root, cpa_binary, fixture=False):
     base=pathlib.Path(__file__).resolve().parents[1]
     root.chmod(0o700)
     for variant,folder in [('global','.qoder'),('cn','.qoder-cn')]:
@@ -50,7 +50,7 @@ def run(root, fixture=False):
     '''
     (root/'config.yaml').write_text(inspect.cleandoc(config))
     log=(root/'server.log').open('w+')
-    p=subprocess.Popen([str(base/'build/cli-proxy-api'),'--config',str(root/'config.yaml'),'--local-model'],cwd=root,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+    p=subprocess.Popen([str(cpa_binary),'--config',str(root/'config.yaml'),'--local-model'],cwd=root,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
     url=f'http://127.0.0.1:{port}'
     def request(path,body=None):
      data=None if body is None else json.dumps(body).encode()
@@ -130,9 +130,15 @@ def run(root, fixture=False):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--fixture',action='store_true',help='Use a local CLI fixture without credentials or model quota')
+    parser.add_argument('--cpa-binary',default=os.environ.get('CPA_BINARY') or shutil.which('cli-proxy-api'),help='Path to an existing CPA executable (or set CPA_BINARY)')
     args=parser.parse_args()
+    if not args.cpa_binary:
+        parser.error('CPA executable not found; pass --cpa-binary or set CPA_BINARY')
+    cpa_binary=pathlib.Path(args.cpa_binary).expanduser().resolve()
+    if not cpa_binary.is_file():
+        parser.error(f'CPA executable does not exist: {cpa_binary}')
     with tempfile.TemporaryDirectory(prefix='cpa-qoder-e2e-') as directory:
-        run(pathlib.Path(directory),args.fixture)
+        run(pathlib.Path(directory),cpa_binary,args.fixture)
 
 
 if __name__ == '__main__':

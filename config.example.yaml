@@ -1,34 +1,20 @@
-# Run from CPA-Qoder: make run
-config-version: 8
-server:
-  host: "127.0.0.1"
-  port: 8317
-access:
-  api-keys:
-    - "replace-with-your-client-key"
-management:
-  allow-remote: false
-  disable-control-panel: true
-oauth:
-  auth-dir: "./auths"
-routing:
-  retry:
-    request-retry: 0
+# Merge this fragment into the CPA configuration.
+# Copy the two auth descriptors into the oauth.auth-dir already used by CPA.
 plugins:
   enabled: true
-  dir: "./build/plugins"
+  dir: "/CLIProxyAPI/plugins"
   configs:
     cpa-qoder:
       enabled: true
       priority: 1
       # CLI transport proxy; empty inherits HTTP(S)_PROXY / ALL_PROXY.
       proxy-url: ""
-      helper: "./build/cpa-qoder-helper"
+      helper: "/CLIProxyAPI/plugin-bin/cpa-qoder-helper"
       global:
-        cli: "qodercli"
-        config-dir: "~/.qoder"
+        cli: "/usr/local/bin/qodercli"
+        config-dir: "/root/.qoder"
         disabled: false
       cn:
-        cli: "qoderclicn"
-        config-dir: "~/.qoder-cn"
+        cli: "/usr/local/bin/qoderclicn"
+        config-dir: "/root/.qoder-cn"
         disabled: false

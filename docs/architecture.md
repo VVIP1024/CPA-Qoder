@@ -2,7 +2,7 @@
 
 ## CPA integration
 
-The plugin targets `github.com/router-for-me/CLIProxyAPI/v8`, Go 1.26, native ABI 1 and RPC schema 6. It uses CPA's native dynamic-library host. Build against a compatible CPA source checkout; executable-plugin documentation does not describe this loader.
+The plugin targets `github.com/router-for-me/CLIProxyAPI/v8 v8.0.0`, Go 1.26, native ABI 1 and RPC schema 6. It uses CPA's native dynamic-library host. The published Go module provides the SDK at build time; executable-plugin documentation does not describe this loader.
 
 | Source | Relevant responsibility |
 |---|---|
