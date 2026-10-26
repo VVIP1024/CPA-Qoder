@@ -1,0 +1,23 @@
+# Merge this fragment into the CPA configuration.
+# Copy the two auth descriptors into the oauth.auth-dir already used by CPA.
+plugins:
+  enabled: true
+  dir: "/CLIProxyAPI/plugins"
+  configs:
+    cpa-qoder:
+      enabled: true
+      priority: 1
+      # CLI transport proxy; empty inherits HTTP(S)_PROXY / ALL_PROXY.
+      proxy-url: ""
+      # How long a request waits for a model the upstream put in a queue.
+      # The request fails with a retryable 429 after this budget; 0 waits forever.
+      queue-wait: "60s"
+      helper: "/CLIProxyAPI/plugin-bin/cpa-qoder-helper"
+      global:
+        cli: "/usr/local/bin/qoder"
+        config-dir: "/root/.qoder"
+        disabled: false
+      cn:
+        cli: "/usr/local/bin/qodercn"
+        config-dir: "/root/.qoder-cn"
+        disabled: false

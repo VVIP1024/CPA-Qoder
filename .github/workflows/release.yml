@@ -1,0 +1,52 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - name: Build Linux package
+        run: make release-linux-${{ matrix.arch }}
+      - name: Check package contents
+        run: |
+          test -s "dist/cpa-qoder-linux-${{ matrix.arch }}.tar.gz"
+          test -s "dist/cpa-qoder-linux-${{ matrix.arch }}.sha256"
+          tar -tzf "dist/cpa-qoder-linux-${{ matrix.arch }}.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-qoder-linux-${{ matrix.arch }}
+          path: |
+            dist/cpa-qoder-linux-${{ matrix.arch }}.tar.gz
+            dist/cpa-qoder-linux-${{ matrix.arch }}.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cpa-qoder-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
